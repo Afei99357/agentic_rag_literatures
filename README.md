@@ -134,6 +134,30 @@ This will:
 - Build the vector database for searching
 - Takes a few minutes depending on document count
 
+### 📄 Adding New PDFs Later
+
+**When you add new PDF files**, you need to reindex to include them in your searches:
+
+```bash
+# 1. Add your new PDFs to the directory
+cp /path/to/new/papers/*.pdf pdfs/
+
+# 2. Reindex to include the new documents
+uv run python main.py --action index --force-reindex
+```
+
+**Important Notes:**
+- `--force-reindex` is **required** when adding new PDFs
+- The system will completely rebuild the database with ALL PDFs (old + new)
+- Without `--force-reindex`, the system uses existing data and ignores new PDFs
+- Reindexing processes all PDFs again, so it takes time proportional to your total collection size
+- You can also type `index` within the interactive chat to trigger reindexing
+
+**Why reindex everything?**
+- Ensures consistency across all documents
+- Applies any improvements in text/table extraction to all documents
+- Maintains optimal vector database performance
+
 ### 4. Start Chatting!
 
 ```bash
