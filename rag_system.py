@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 from pathlib import Path
 import hashlib
 from datetime import datetime
@@ -12,14 +12,13 @@ from contextlib import contextmanager
 import threading
 from collections import defaultdict
 import gc
-import weakref
+import shutil
 
 # Direct library imports (no LangChain)
 try:
     import fitz  # PyMuPDF - much faster alternative
     PYMUPDF_AVAILABLE = True
 except ImportError:
-    import PyPDF2
     import pdfplumber
     PYMUPDF_AVAILABLE = False
 
@@ -28,21 +27,15 @@ import chromadb
 from chromadb.config import Settings
 import ollama
 from dataclasses import dataclass
-from typing import Any
 from dotenv import load_dotenv
 import pandas as pd
 from enum import Enum
-import re
-from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class ToolType(Enum):
     RETRIEVAL = "retrieval"
-    ANALYSIS = "analysis"
-    SEARCH = "search"
-    SYNTHESIS = "synthesis"
 
 @dataclass
 class ToolResult:
@@ -613,16 +606,27 @@ class LiteratureRAG:
         optimal_batch_size = 8  # Smaller batch size for better memory management (reduced from 16)
         
         all_embeddings = []
+        total_texts = len(texts)
         
-        for i in range(0, len(texts), max_chunk_size):
+        # Show a single progress message for the entire embedding process
+        if total_texts > 100:
+            logger.info(f"📊 Generating embeddings for {total_texts} text chunks...")
+        
+        for i in range(0, total_texts, max_chunk_size):
             chunk_texts = texts[i:i + max_chunk_size]
             chunk_batch_size = min(len(chunk_texts), optimal_batch_size)
+            
+            # Show progress for each major chunk (not internal batches)
+            if total_texts > 100:
+                progress = min(i + len(chunk_texts), total_texts)
+                percentage = (progress / total_texts) * 100
+                logger.info(f"  ➤ Embedding progress: {progress}/{total_texts} ({percentage:.1f}%)")
             
             try:
                 embeddings = self.embedding_model.encode(
                     chunk_texts,
                     batch_size=chunk_batch_size,
-                    show_progress_bar=len(texts) > 100,
+                    show_progress_bar=False,  # Disable the confusing internal progress bars
                     normalize_embeddings=True,
                     convert_to_tensor=False
                 )
@@ -642,10 +646,9 @@ class LiteratureRAG:
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-            
-            # Log progress for large datasets
-            if len(texts) > 1000:
-                logger.info(f"Processed embeddings for {i + len(chunk_texts)}/{len(texts)} texts")
+        
+        if total_texts > 100:
+            logger.info(f"✅ Embedding generation complete for {total_texts} chunks")
         
         return all_embeddings
     
@@ -799,8 +802,17 @@ class LiteratureRAG:
             return False
     
     def _clear_collections(self) -> None:
-        """Clear existing collections for force reindexing"""
+        """Clear existing collections for force reindexing and clean up orphaned directories"""
         try:
+            # Get list of directories before deletion to identify orphaned ones
+            existing_dirs_before = set()
+            if os.path.exists(self.db_directory):
+                for item in os.listdir(self.db_directory):
+                    item_path = os.path.join(self.db_directory, item)
+                    # Check if it's a UUID-format directory (36 chars with hyphens)
+                    if os.path.isdir(item_path) and len(item) == 36 and item.count('-') == 4:
+                        existing_dirs_before.add(item)
+            
             # Try to delete text collection
             try:
                 self.chroma_client.delete_collection(name=self.text_collection_name)
@@ -814,6 +826,33 @@ class LiteratureRAG:
                 logger.info(f"Cleared existing table collection: {self.table_collection_name}")
             except Exception as e:
                 logger.info(f"Table collection {self.table_collection_name} doesn't exist or couldn't be deleted: {e}")
+            
+            # Clean up orphaned ChromaDB directories
+            # ChromaDB sometimes doesn't remove the physical directories when collections are deleted
+            if existing_dirs_before and os.path.exists(self.db_directory):
+                # Get current directories after deletion
+                existing_dirs_after = set()
+                for item in os.listdir(self.db_directory):
+                    item_path = os.path.join(self.db_directory, item)
+                    if os.path.isdir(item_path) and len(item) == 36 and item.count('-') == 4:
+                        existing_dirs_after.add(item)
+                
+                # Find orphaned directories (existed before, still exist after deletion)
+                orphaned_dirs = existing_dirs_before.intersection(existing_dirs_after)
+                
+                for orphaned_dir in orphaned_dirs:
+                    orphaned_path = os.path.join(self.db_directory, orphaned_dir)
+                    try:
+                        # Double-check that no collections reference this directory
+                        active_collections = [col.name for col in self.chroma_client.list_collections()]
+                        # If we just deleted our collections and no others exist, it's safe to remove
+                        if not active_collections or (active_collections and 
+                            self.text_collection_name not in active_collections and 
+                            self.table_collection_name not in active_collections):
+                            logger.info(f"🧹 Removing orphaned ChromaDB directory: {orphaned_dir}")
+                            shutil.rmtree(orphaned_path)
+                    except Exception as e:
+                        logger.warning(f"Could not clean up orphaned directory {orphaned_dir}: {e}")
                 
         except Exception as e:
             logger.warning(f"Error clearing collections: {e}")
@@ -1231,26 +1270,43 @@ Answer: """
         # Execute plan
         tool_results = self._execute_plan(plan)
         
-        # Get final result from synthesizer
-        synthesis_result = None
+        # Get documents from retriever and use basic RAG approach
+        retrieval_result = None
         for result in tool_results:
-            if result.tool_name == 'synthesizer':
-                synthesis_result = result
+            if result.tool_name == 'retriever':
+                retrieval_result = result
                 break
         
-        if synthesis_result and synthesis_result.success:
-            final_result = synthesis_result.result
-            if isinstance(final_result, dict):
-                answer = final_result.get('answer', 'No answer generated.')
-                sources = final_result.get('sources', [])
-                tools_used = final_result.get('tools_used', [])
-            else:
-                answer = str(final_result)
+        if retrieval_result and retrieval_result.success:
+            # Use retrieved documents with basic RAG approach
+            documents = retrieval_result.result
+            if documents:
+                # Format context from retrieved documents
+                context_parts = []
                 sources = []
-                tools_used = []
+                for doc in documents[:7]:  # Use top 7 docs
+                    if isinstance(doc, dict):
+                        metadata = doc.get('metadata', {})
+                        paper_name = metadata.get('paper_name', 'Unknown')
+                        page = metadata.get('page', 'N/A')
+                        content = doc.get('content', '')
+                        context_parts.append(f"[{paper_name}, p.{page}]: {content}")
+                        sources.append({
+                            'paper': paper_name,
+                            'page': page,
+                            'type': metadata.get('source_type', 'text')
+                        })
+                
+                combined_context = "\n\n".join(context_parts)
+                answer = self._generate_response(question, combined_context)
+                tools_used = ['retriever']
+            else:
+                answer = "No relevant documents found."
+                sources = []
+                tools_used = ['retriever']
         else:
-            # Fallback to basic RAG if synthesis fails
-            logger.warning("Synthesis failed, falling back to basic RAG")
+            # Fallback to basic RAG if retrieval fails
+            logger.warning("Retrieval failed, falling back to basic RAG")
             basic_result = self.query(question)
             answer = basic_result['answer']
             sources = basic_result['sources']
@@ -1286,131 +1342,104 @@ Answer: """
         return response
     
     def _initialize_agentic_tools(self):
-        """Initialize agentic tools for advanced query processing"""
+        """Initialize streamlined agentic tools"""
         self._agentic_tools = {
-            'document_retriever': DocumentRetrieverTool(),
-            'summarizer': SummarizationTool(),
-            'comparator': ComparisonTool(),
-            'refined_searcher': RefinedSearchTool(),
-            'synthesizer': SynthesisTool()
+            'retriever': DocumentRetrieverTool()
         }
-        logger.info("Agentic tools initialized")
+        logger.info("Streamlined agentic tools initialized")
     
     def _analyze_query_complexity(self, query: str) -> Dict[str, Any]:
-        """Analyze query to determine complexity and required tools"""
-        analysis = {
-            'complexity': 'simple',
-            'requires_comparison': False,
-            'requires_synthesis': False,
-            'requires_multi_step': False,
-            'focus_areas': []
-        }
-        
-        # Keywords that indicate different types of analysis needed
-        comparison_keywords = ['compare', 'contrast', 'difference', 'versus', 'vs', 'similarities', 'differ']
-        synthesis_keywords = ['overview', 'comprehensive', 'summary', 'synthesize', 'integrate', 'combine']
-        complex_keywords = ['methodology', 'approach', 'framework', 'analysis', 'evaluation', 'assessment']
-        
+        """Simple query analysis for retrieval-only approach"""
         query_lower = query.lower()
         
-        # Check for comparison needs
-        if any(keyword in query_lower for keyword in comparison_keywords):
-            analysis['requires_comparison'] = True
-            analysis['complexity'] = 'moderate'
+        # Intent detection based on keywords
+        intent = 'explain'  # Default
+        if any(word in query_lower for word in ['compare', 'contrast', 'difference', 'versus', 'vs']):
+            intent = 'compare'
+        elif any(word in query_lower for word in ['summarize', 'summary', 'overview']):
+            intent = 'summarize'
+        elif any(word in query_lower for word in ['find', 'what is', 'how much', 'when', 'where']):
+            intent = 'find'
+        elif any(word in query_lower for word in ['explain', 'how', 'why', 'mechanism']):
+            intent = 'explain'
+        elif any(word in query_lower for word in ['analyze', 'analysis', 'evaluate']):
+            intent = 'analyze'
         
-        # Check for synthesis needs
-        if any(keyword in query_lower for keyword in synthesis_keywords):
-            analysis['requires_synthesis'] = True
-            analysis['complexity'] = 'moderate'
+        # For simplicity, we'll treat most queries as simple since we only do retrieval
+        complexity = 'simple'
         
-        # Check for complex analysis
-        if any(keyword in query_lower for keyword in complex_keywords):
-            analysis['complexity'] = 'complex'
-            analysis['requires_multi_step'] = True
-        
-        # Determine focus areas
-        if 'method' in query_lower or 'approach' in query_lower:
-            analysis['focus_areas'].append('methodology')
-        if 'result' in query_lower or 'finding' in query_lower:
-            analysis['focus_areas'].append('results')
-        if 'data' in query_lower or 'dataset' in query_lower:
-            analysis['focus_areas'].append('data')
-        if 'limitation' in query_lower or 'challenge' in query_lower:
-            analysis['focus_areas'].append('limitations')
-        
-        return analysis
+        return {
+            'complexity': complexity,
+            'requires_comparison': False,
+            'requires_synthesis': True,
+            'requires_multi_step': False,
+            'focus_areas': [],
+            'entities': [],
+            'intent': intent,
+            'confidence': 0.6
+        }
     
     def _create_execution_plan(self, query: str, analysis: Dict[str, Any]) -> QueryPlan:
-        """Create execution plan based on query analysis"""
+        """Create adaptive execution plan based on intent and complexity"""
+        
+        # Since we're using a simple approach, no query decomposition needed
         sub_queries = [query]
         tools_sequence = []
         
-        # Always start with document retrieval
-        tools_sequence.append({
-            'tool': 'document_retriever',
-            'context': {
-                'retrieval_count': 7 if analysis['complexity'] == 'simple' else 10,
-                'include_tables': True
+        # Determine retrieval strategy based on intent
+        # Simple, effective 1-tool approach - just retrieve documents
+        tools_sequence = [
+            {
+                'tool': 'retriever',
+                'context': {
+                    'retrieval_count': 7,
+                    'include_tables': True
+                },
+                'confidence_threshold': 0.7
             }
-        })
+        ]
         
-        # Add refinement search for complex queries
-        if analysis['complexity'] in ['moderate', 'complex']:
-            search_focus = analysis['focus_areas'][0] if analysis['focus_areas'] else 'general'
-            tools_sequence.append({
-                'tool': 'refined_searcher',
-                'context': {'search_focus': search_focus},
-                'depends_on': ['document_retriever']
-            })
+        reasoning = self._generate_plan_reasoning(analysis, tools_sequence)
         
-        # Add comparison if needed
-        if analysis['requires_comparison']:
-            tools_sequence.append({
-                'tool': 'comparator',
-                'context': {},
-                'depends_on': ['document_retriever']
-            })
-        
-        # Add summarization for complex queries
-        if analysis['complexity'] == 'complex' or len(analysis['focus_areas']) > 1:
-            tools_sequence.append({
-                'tool': 'summarizer',
-                'context': {},
-                'depends_on': ['document_retriever']
-            })
-        
-        # Always end with synthesis
-        tools_sequence.append({
-            'tool': 'synthesizer',
-            'context': {},
-            'depends_on': ['document_retriever']
-        })
-        
-        reasoning = f"Query complexity: {analysis['complexity']}. "
-        if analysis['requires_comparison']:
-            reasoning += "Comparison analysis needed. "
-        if analysis['requires_synthesis']:
-            reasoning += "Multi-source synthesis required. "
-        if analysis['focus_areas']:
-            reasoning += f"Focus areas: {', '.join(analysis['focus_areas'])}."
-        
-        return QueryPlan(
+        plan = QueryPlan(
             original_query=query,
             sub_queries=sub_queries,
             tools_sequence=tools_sequence,
             reasoning=reasoning
         )
+        
+        return plan
+    
+    def _generate_plan_reasoning(self, analysis: Dict[str, Any], tools_sequence: List[Dict]) -> str:
+        """Generate reasoning for the execution plan"""
+        tools_used = [t['tool'] for t in tools_sequence]
+        reasoning = f"Intent: {analysis.get('intent', 'analyze')}. "
+        reasoning += f"Complexity: {analysis['complexity']}. "
+        reasoning += f"Tools: {' → '.join(tools_used)}. "
+        
+        if analysis.get('entities'):
+            reasoning += f"Key entities: {', '.join(analysis['entities'][:3])}. "
+        if analysis.get('focus_areas'):
+            reasoning += f"Focus: {', '.join(analysis['focus_areas'])}."
+        
+        return reasoning
     
     def _execute_plan(self, plan: QueryPlan) -> List[ToolResult]:
-        """Execute the planned sequence of tool calls"""
+        """Execute plan with adaptive refinement and confidence tracking"""
         results = {}
         execution_order = []
+        confidence_scores = {}
         
-        # Build dependency graph and execution order
+        # Track execution metadata
+        execution_metadata = {
+            'retries': 0,
+            'fallbacks': 0,
+            'refinements': 0
+        }
+        
         remaining_tools = plan.tools_sequence.copy()
         
         while remaining_tools:
-            # Find tools with no dependencies or all dependencies satisfied
             ready_tools = []
             for tool_config in remaining_tools:
                 dependencies = tool_config.get('depends_on', [])
@@ -1418,38 +1447,106 @@ Answer: """
                     ready_tools.append(tool_config)
             
             if not ready_tools:
-                # Break dependency cycle by executing first remaining tool
+                # Check if we should switch to alternative plan
                 ready_tools = [remaining_tools[0]]
-                logger.warning("Potential dependency cycle detected, proceeding with first available tool")
+                logger.warning("Dependency cycle detected, forcing execution")
             
-            # Execute ready tools
             for tool_config in ready_tools:
                 tool_name = tool_config['tool']
                 tool_context = tool_config['context'].copy()
+                confidence_threshold = tool_config.get('confidence_threshold', 0.7)
                 
-                # Add results from dependency tools to context
+                # Aggregate context from dependencies
                 dependencies = tool_config.get('depends_on', [])
                 for dep in dependencies:
                     if dep in results:
-                        if dep == 'document_retriever':
+                        if dep == 'retriever':
                             tool_context['documents'] = results[dep].result
                             tool_context['initial_results'] = results[dep].result
                         else:
                             tool_context[f'{dep}_result'] = results[dep].result
                 
-                # Execute tool
+                # Execute tool with retry logic
                 tool = self._agentic_tools[tool_name]
                 logger.info(f"Executing tool: {tool_name}")
+                
                 result = tool.execute(plan.original_query, tool_context, self)
+                
+                # Validate result and calculate confidence
+                confidence = self._validate_tool_result(result, tool_config)
+                confidence_scores[tool_name] = confidence
+                
+                # Handle low confidence results
+                if confidence < confidence_threshold and execution_metadata['retries'] < 2:
+                    logger.info(f"Low confidence ({confidence:.2f}) for {tool_name}, attempting refinement")
+                    
+                    # Try to refine the result
+                    refined_context = tool_context.copy()
+                    refined_context['refinement_needed'] = True
+                    refined_context['previous_confidence'] = confidence
+                    
+                    result = tool.execute(plan.original_query, refined_context, self)
+                    new_confidence = self._validate_tool_result(result, tool_config)
+                    
+                    if new_confidence > confidence:
+                        confidence = new_confidence
+                        confidence_scores[tool_name] = confidence
+                        execution_metadata['refinements'] += 1
+                        logger.info(f"Refinement improved confidence to {confidence:.2f}")
+                
                 results[tool_name] = result
                 execution_order.append(tool_name)
                 
-                logger.info(f"Tool {tool_name} completed in {result.execution_time:.2f}s - Success: {result.success}")
+                # Add confidence to result metadata
+                if not hasattr(result, 'metadata'):
+                    result.metadata = {}
+                result.metadata['confidence'] = confidence
+                
+                logger.info(f"Tool {tool_name} completed in {result.execution_time:.2f}s - Success: {result.success} - Confidence: {confidence:.2f}")
             
-            # Remove executed tools
             remaining_tools = [t for t in remaining_tools if t['tool'] not in execution_order]
         
+        # Add execution metadata to results
+        for result in results.values():
+            if hasattr(result, 'metadata'):
+                result.metadata['execution_stats'] = execution_metadata
+        
         return list(results.values())
+    
+    def _validate_tool_result(self, result: ToolResult, tool_config: Dict) -> float:
+        """Validate tool result and calculate confidence score"""
+        if not result or not result.success:
+            return 0.0
+        
+        confidence = 0.5  # Base confidence
+        
+        # Check if result has content
+        if hasattr(result, 'result'):
+            if result.result:
+                confidence += 0.2
+                
+                # Check result size/quality
+                if isinstance(result.result, (list, dict)):
+                    if len(str(result.result)) > 100:
+                        confidence += 0.1
+                    if isinstance(result.result, dict) and 'answer' in result.result:
+                        confidence += 0.1
+                elif isinstance(result.result, str) and len(result.result) > 50:
+                    confidence += 0.2
+        
+        # Check execution time (faster is generally better for simple tools)
+        if hasattr(result, 'execution_time'):
+            if result.execution_time < 2.0:
+                confidence += 0.1
+        
+        # Tool-specific validation
+        tool_name = tool_config.get('tool', '')
+        if tool_name == 'document_retriever' and hasattr(result, 'metadata'):
+            doc_count = result.metadata.get('documents_retrieved', 0)
+            if doc_count > 0:
+                confidence = min(confidence + (doc_count * 0.05), 0.95)
+        
+        return min(confidence, 1.0)
 
 
 class DocumentRetrieverTool(AgentTool):
@@ -1505,337 +1602,3 @@ class DocumentRetrieverTool(AgentTool):
                 execution_time=execution_time
             )
 
-
-class SummarizationTool(AgentTool):
-    def __init__(self):
-        super().__init__(
-            name="summarizer",
-            description="Summarizes documents or passages to extract key information",
-            tool_type=ToolType.ANALYSIS
-        )
-    
-    def execute(self, query: str, context: Dict[str, Any], rag_system) -> ToolResult:
-        import time
-        start_time = time.perf_counter()
-        
-        try:
-            documents = context.get('documents', [])
-            if not documents:
-                raise ValueError("No documents provided for summarization")
-            
-            # Create context from documents
-            doc_contents = []
-            for doc in documents:
-                paper_name = doc.get('metadata', {}).get('paper_name', 'Unknown')
-                page = doc.get('metadata', {}).get('page', 'N/A')
-                content = doc.get('content', '')
-                doc_contents.append(f"[{paper_name}, p.{page}]: {content}")
-            
-            combined_context = "\n\n".join(doc_contents)
-            
-            # Generate summary
-            summary_prompt = f"""Summarize the key points from the following academic content in relation to: {query}
-
-Content:
-{combined_context}
-
-Please provide a concise summary highlighting the main findings, methodologies, and conclusions relevant to the query."""
-            
-            response = rag_system.llm_client.chat(
-                model=rag_system.llm_model,
-                messages=[
-                    {"role": "system", "content": "You are a research assistant that creates concise, accurate summaries."},
-                    {"role": "user", "content": summary_prompt}
-                ],
-                options={"temperature": 0.2}
-            )
-            
-            summary = rag_system._filter_thinking_sections(response['message']['content'])
-            
-            execution_time = time.perf_counter() - start_time
-            return ToolResult(
-                tool_name=self.name,
-                success=True,
-                result=summary,
-                metadata={'query': query, 'doc_count': len(documents)},
-                execution_time=execution_time
-            )
-        
-        except Exception as e:
-            execution_time = time.perf_counter() - start_time
-            return ToolResult(
-                tool_name=self.name,
-                success=False,
-                result=str(e),
-                metadata={'query': query, 'error': str(e)},
-                execution_time=execution_time
-            )
-
-
-class ComparisonTool(AgentTool):
-    def __init__(self):
-        super().__init__(
-            name="comparator",
-            description="Compares findings, methodologies, or results across different papers",
-            tool_type=ToolType.ANALYSIS
-        )
-    
-    def execute(self, query: str, context: Dict[str, Any], rag_system) -> ToolResult:
-        import time
-        start_time = time.perf_counter()
-        
-        try:
-            documents = context.get('documents', [])
-            if len(documents) < 2:
-                raise ValueError("Need at least 2 documents for comparison")
-            
-            # Group documents by paper
-            papers = {}
-            for doc in documents:
-                paper_name = doc.get('metadata', {}).get('paper_name', 'Unknown')
-                if paper_name not in papers:
-                    papers[paper_name] = []
-                papers[paper_name].append(doc)
-            
-            # Create comparison context
-            paper_summaries = []
-            for paper_name, paper_docs in papers.items():
-                content_parts = []
-                for doc in paper_docs:
-                    page = doc.get('metadata', {}).get('page', 'N/A')
-                    content = doc.get('content', '')[:500]  # Limit length
-                    content_parts.append(f"Page {page}: {content}")
-                
-                paper_summary = f"**{paper_name}**:\n" + "\n".join(content_parts)
-                paper_summaries.append(paper_summary)
-            
-            comparison_context = "\n\n".join(paper_summaries)
-            
-            # Generate comparison
-            comparison_prompt = f"""Compare and contrast the information from the following papers regarding: {query}
-
-Papers:
-{comparison_context}
-
-Please provide a structured comparison highlighting:
-1. Similarities in approaches/findings
-2. Key differences 
-3. Conflicting results (if any)
-4. Complementary insights"""
-            
-            response = rag_system.llm_client.chat(
-                model=rag_system.llm_model,
-                messages=[
-                    {"role": "system", "content": "You are a research analyst expert at comparing academic literature."},
-                    {"role": "user", "content": comparison_prompt}
-                ],
-                options={"temperature": 0.3}
-            )
-            
-            comparison = rag_system._filter_thinking_sections(response['message']['content'])
-            
-            execution_time = time.perf_counter() - start_time
-            return ToolResult(
-                tool_name=self.name,
-                success=True,
-                result=comparison,
-                metadata={'query': query, 'papers_compared': list(papers.keys())},
-                execution_time=execution_time
-            )
-        
-        except Exception as e:
-            execution_time = time.perf_counter() - start_time
-            return ToolResult(
-                tool_name=self.name,
-                success=False,
-                result=str(e),
-                metadata={'query': query, 'error': str(e)},
-                execution_time=execution_time
-            )
-
-
-class RefinedSearchTool(AgentTool):
-    def __init__(self):
-        super().__init__(
-            name="refined_searcher",
-            description="Performs targeted searches with refined queries based on initial results",
-            tool_type=ToolType.SEARCH
-        )
-    
-    def execute(self, query: str, context: Dict[str, Any], rag_system) -> ToolResult:
-        import time
-        start_time = time.perf_counter()
-        
-        try:
-            initial_results = context.get('initial_results', [])
-            search_focus = context.get('search_focus', 'methodology')
-            
-            # Generate refined search terms based on initial results
-            if initial_results:
-                # Extract key terms from initial results
-                content_sample = "\n".join([
-                    doc.get('content', '')[:200] for doc in initial_results[:3]
-                ])
-                
-                refinement_prompt = f"""Based on this initial search result sample for the query "{query}", suggest 2-3 more specific search terms that could help find additional relevant information, focusing on {search_focus}:
-
-Sample content:
-{content_sample}
-
-Provide only the search terms, one per line."""
-                
-                response = rag_system.llm_client.chat(
-                    model=rag_system.llm_model,
-                    messages=[
-                        {"role": "system", "content": "You are a research librarian expert at creating targeted search queries."},
-                        {"role": "user", "content": refinement_prompt}
-                    ],
-                    options={"temperature": 0.4}
-                )
-                
-                refined_terms = rag_system._filter_thinking_sections(response['message']['content']).strip().split('\n')
-                refined_terms = [term.strip('- ').strip() for term in refined_terms if term.strip()]
-            else:
-                refined_terms = [query]
-            
-            # Perform searches with refined terms
-            all_refined_docs = []
-            for term in refined_terms[:3]:  # Limit to top 3 terms
-                if term:
-                    text_docs = rag_system._similarity_search(rag_system.text_collection, term, k=3)
-                    for doc in text_docs:
-                        all_refined_docs.append({
-                            'content': doc.page_content,
-                            'metadata': doc.metadata,
-                            'source_type': doc.metadata.get('source_type', 'text'),
-                            'search_term': term
-                        })
-            
-            # Remove duplicates based on content hash
-            seen_hashes = set()
-            unique_docs = []
-            for doc in all_refined_docs:
-                content_hash = hash(doc['content'])
-                if content_hash not in seen_hashes:
-                    seen_hashes.add(content_hash)
-                    unique_docs.append(doc)
-            
-            execution_time = time.perf_counter() - start_time
-            return ToolResult(
-                tool_name=self.name,
-                success=True,
-                result=unique_docs,
-                metadata={
-                    'original_query': query,
-                    'refined_terms': refined_terms,
-                    'results_found': len(unique_docs)
-                },
-                execution_time=execution_time
-            )
-        
-        except Exception as e:
-            execution_time = time.perf_counter() - start_time
-            return ToolResult(
-                tool_name=self.name,
-                success=False,
-                result=str(e),
-                metadata={'query': query, 'error': str(e)},
-                execution_time=execution_time
-            )
-
-
-class SynthesisTool(AgentTool):
-    def __init__(self):
-        super().__init__(
-            name="synthesizer",
-            description="Synthesizes information from multiple tool results to create comprehensive answers",
-            tool_type=ToolType.SYNTHESIS
-        )
-    
-    def execute(self, query: str, context: Dict[str, Any], rag_system) -> ToolResult:
-        import time
-        start_time = time.perf_counter()
-        
-        try:
-            tool_results = context.get('tool_results', [])
-            documents = context.get('documents', [])
-            
-            # Use documents from retrieval if available
-            if documents:
-                synthesis_content = []
-                sources = []
-                
-                # Extract sources from retrieval results
-                for doc in documents:
-                    if isinstance(doc, dict):
-                        metadata = doc.get('metadata', {})
-                        sources.append({
-                            'paper': metadata.get('paper_name', 'Unknown'),
-                            'page': metadata.get('page', 'N/A'),
-                            'type': metadata.get('source_type', 'text')
-                        })
-                
-                # Create comprehensive synthesis
-                context_parts = []
-                for doc in documents[:7]:  # Use top 7 docs
-                    if isinstance(doc, dict):
-                        metadata = doc.get('metadata', {})
-                        paper_name = metadata.get('paper_name', 'Unknown')
-                        page = metadata.get('page', 'N/A')
-                        content = doc.get('content', '')
-                        context_parts.append(f"[{paper_name}, p.{page}]: {content}")
-                
-                combined_context = "\n\n".join(context_parts)
-                
-                synthesis_prompt = f"""Based on the following research literature, provide a CONCISE answer to: {query}
-
-Literature:
-{combined_context}
-
-Please provide a brief, direct response (2-4 sentences) that synthesizes the key information from the sources and cites the papers appropriately. Avoid lengthy explanations unless specifically requested."""
-                
-                response = rag_system.llm_client.chat(
-                    model=rag_system.llm_model,
-                    messages=[
-                        {"role": "system", "content": "You are a research analyst creating comprehensive literature-based answers."},
-                        {"role": "user", "content": synthesis_prompt}
-                    ],
-                    options={"temperature": 0.3}
-                )
-                
-                synthesis_text = rag_system._filter_thinking_sections(response['message']['content'])
-            else:
-                synthesis_text = "No sufficient information found to synthesize a comprehensive answer."
-                sources = []
-            
-            # Deduplicate sources
-            unique_sources = []
-            seen_sources = set()
-            for source in sources:
-                source_key = f"{source['paper']}_{source['page']}_{source['type']}"
-                if source_key not in seen_sources:
-                    unique_sources.append(source)
-                    seen_sources.add(source_key)
-            
-            execution_time = time.perf_counter() - start_time
-            return ToolResult(
-                tool_name=self.name,
-                success=True,
-                result={
-                    'answer': synthesis_text,
-                    'sources': unique_sources,
-                    'tools_used': ['document_retriever', 'synthesizer']
-                },
-                metadata={'query': query, 'sources_count': len(unique_sources)},
-                execution_time=execution_time
-            )
-        
-        except Exception as e:
-            execution_time = time.perf_counter() - start_time
-            return ToolResult(
-                tool_name=self.name,
-                success=False,
-                result=str(e),
-                metadata={'query': query, 'error': str(e)},
-                execution_time=execution_time
-            )

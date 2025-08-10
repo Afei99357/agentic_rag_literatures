@@ -1,37 +1,26 @@
-# 🤖 Agentic Literature RAG - Smart Document Chat Bot
+# 🤖 Literature RAG - Smart Document Chat Bot
 
-An advanced **Agentic RAG** system that acts like a smart chat bot for your academic 
+A **streamlined RAG** system that acts like a smart chat bot for your academic 
 literature. Simply start it up and ask questions naturally - no complex commands needed! 
-Features intelligent query planning, multi-tool execution, enhanced PDF processing, 
-table extraction, and concise synthesis capabilities.
+Features intelligent document retrieval, enhanced PDF processing, table extraction, 
+and concise answer generation.
 
 ## ✨ What Makes This Special?
 
-- **🤖 Always Agentic**: Every query automatically uses intelligent multi-tool processing
+- **🎯 Simple & Fast**: Streamlined single-tool approach for optimal performance
 - **💬 Natural Chat Interface**: Just start it and ask questions like talking to a research assistant  
 - **📄 Smart Document Processing**: Handles both text and tables from PDFs automatically
-- **🎯 Concise Answers**: Gets straight to the point with 2-4 sentence responses
+- **⚡ Lightning Fast**: ~4 second responses with accurate citations
 - **🔧 Zero Configuration**: Works out of the box with local models - no API keys needed!
 
 ## Features
 
-### 🤖 Agentic Intelligence
+### 🎯 Streamlined Intelligence
 
-- **Intelligent Query Planning**: Automatically analyzes query complexity and creates 
-  execution plans
-- **Multi-Tool Orchestration**: Coordinates multiple specialized tools for 
-  comprehensive answers
-- **Adaptive Reasoning**: Selects appropriate analysis strategies based on query type
-- **Tool Dependencies**: Manages tool execution order and data flow between tools
-- **Performance Monitoring**: Tracks tool execution and provides detailed analytics
-
-### 🔧 Specialized Agent Tools
-
-- **Document Retriever**: Advanced semantic search across text and tables
-- **Summarization Tool**: Extracts key insights from retrieved documents
-- **Comparison Tool**: Analyzes similarities and differences across papers
-- **Refined Search Tool**: Generates and executes targeted follow-up queries
-- **Synthesis Tool**: Creates comprehensive answers from multiple tool outputs
+- **Smart Document Retrieval**: Advanced semantic search across text and tables
+- **Intent Recognition**: Automatically detects question types (explain, find, compare, etc.)
+- **Intelligent Synthesis**: Uses optimized LLM prompting for concise, accurate answers
+- **Performance Optimized**: Single-tool approach eliminates complexity while maintaining quality
 
 ### Enhanced PDF Processing
 
@@ -130,7 +119,22 @@ Place your PDF files in the `pdfs/` directory:
 cp /path/to/your/papers/*.pdf pdfs/
 ```
 
-### 3. Start Chatting!
+### 3. First Time Setup - Index Your PDFs
+
+**Important**: When you first add PDFs, you need to index them before querying:
+
+```bash
+# Index your PDFs (required first time and when adding new documents)
+uv run python main.py --action index --force-reindex
+```
+
+This will:
+- Process all PDFs in the `pdfs/` directory
+- Extract text and tables 
+- Build the vector database for searching
+- Takes a few minutes depending on document count
+
+### 4. Start Chatting!
 
 ```bash
 # Start the interactive chat bot (default)
@@ -172,7 +176,7 @@ Once you start the chat bot with `python main.py`, you can use these commands:
 
 ### Sample Questions
 
-The chat bot handles all types of questions intelligently:
+The chat bot handles all types of questions with fast, accurate responses:
 
 **Simple Questions:**
 ```
@@ -181,12 +185,12 @@ What methods were used?
 What datasets are mentioned?
 ```
 
-**Complex Analysis:**
+**Analysis Questions:**
 ```
 Compare the attention mechanisms across different papers
 What are the common limitations mentioned in the literature?
 How do the evaluation metrics differ between studies?
-Summarize the evolution of techniques across papers
+What are the key contributions of each paper?
 ```
 
 **Research-Focused:**
@@ -194,7 +198,7 @@ Summarize the evolution of techniques across papers
 What gaps in research are identified?
 What future work is suggested?
 How do the results compare across different approaches?
-What are the key contributions of each paper?
+What mechanisms are described for circadian rhythms?
 ```
 
 ## ⚙️ Configuration
@@ -206,7 +210,8 @@ The system uses free, local models by default:
 - **Embeddings**: ModernBERT-base (with ONNX backend for native multithreading) 
   or MiniLM-L6-v2 fallback
 - **LLM**: Ollama with qwen3:latest 
-- **Responses**: Automatically generates concise, direct answers (2-4 sentences)
+- **Architecture**: Streamlined single-tool approach for optimal performance
+- **Responses**: Automatically generates concise, direct answers with citations
 
 No API keys required!
 
@@ -255,12 +260,36 @@ uv run python main.py --action index --batch-size 200
 
 ```
 agentic-rag/
-   pdfs/              # Place your PDF files here
-   chroma_db/         # Vector database storage (auto-created)
-   main.py            # Complete application - chat bot & CLI
-   rag_system.py      # Core RAG implementation with agentic tools
-   .env               # Configuration (optional)
+│
+├── pdfs/                  # ⚠️ Create this folder and add your PDF files
+│   └── (your PDFs here)   # Not included in repo - you must add PDFs
+│
+├── chroma_db/             # 🔄 Auto-created when you index PDFs (not in repo)
+│   ├── chroma.sqlite3     # SQLite database file
+│   └── UUID-folders/      # Vector embeddings storage
+│
+├── main.py                # Main CLI interface  
+├── rag_system.py          # Core RAG implementation with document retrieval
+├── pyproject.toml         # Project dependencies (managed by uv)
+├── uv.lock                # Locked dependencies
+├── README.md              # This file
+├── CLAUDE.md              # Development guidelines for Claude Code
+├── .gitignore             # Git ignore (excludes pdfs/ and chroma_db/)
+└── .env                   # Configuration (optional, not required)
 ```
+
+### ⚠️ Important Setup Notes:
+
+1. **Create the `pdfs/` folder**: This folder is not included in the repository
+   ```bash
+   mkdir pdfs
+   ```
+
+2. **Add your PDF files**: Place any PDF documents you want to index in the `pdfs/` folder
+
+3. **The `chroma_db/` folder**: Will be created automatically when you run the indexing command for the first time
+
+These folders are intentionally excluded from version control (see `.gitignore`) to avoid committing large files and user-specific data.
 
 ## Troubleshooting
 
@@ -300,12 +329,13 @@ agentic-rag/
 - Optional: CUDA-compatible GPU for accelerated embeddings
 - Ollama (for local LLM)
 
-## New Features in Enhanced Version
+## Key Features
 
 ### Performance Optimizations
 
+- **Streamlined Architecture**: Single-tool approach eliminates multi-tool overhead
 - **ONNX Backend**: Uses ONNX runtime for native CPU multithreading without 
-  Python GIL limitations
+  Python GIL limitations  
 - **ModernBERT Architecture**: Advanced transformer model with RoPE and optimized 
   attention mechanisms
 - **Intelligent Fallback**: ModernBERT-base → MiniLM-L6-v2 + ONNX → MiniLM-L6-v2 + PyTorch
@@ -313,7 +343,7 @@ agentic-rag/
   memory cleanup
 - **Native Multithreading**: PyTorch thread configuration leverages all CPU cores efficiently
 - **GPU Acceleration**: Automatic CUDA detection with fallback to optimized CPU inference
-- **Performance Profiling**: Built-in profiling system to monitor and optimize performance
+- **Fast Responses**: ~4 second query processing vs complex multi-tool approaches
 
 ### Table Processing
 
