@@ -76,8 +76,22 @@ table extraction, and concise synthesis capabilities.
 
 ### 1. Prerequisites
 
+#### Install uv (Python Package Manager)
+First, install uv for dependency management:
+
+```bash
+# Linux/macOS
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+# Or with homebrew (macOS)
+brew install uv
+```
+
 #### Install Ollama
-First, install Ollama for local LLM inference:
+Next, install Ollama for local LLM inference:
 
 ```bash
 # Linux/WSL
