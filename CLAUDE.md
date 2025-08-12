@@ -54,7 +54,7 @@ This system implements an agentic approach where queries trigger intelligent mul
 Tools execute based on dependency graphs defined in `QueryPlan.tools_sequence`. The `_execute_plan()` method handles:
 - Dependency resolution and execution ordering
 - Context passing between tools (e.g., `documents` from DocumentRetriever to other tools)
-- Error handling and fallback to basic RAG
+- Error handling with informative responses when tools fail
 
 ### Query Complexity Analysis
 Automatic categorization based on keywords:

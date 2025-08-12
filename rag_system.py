@@ -97,14 +97,19 @@ class ProfilerStats:
         with self._lock:
             self.stats.clear()
 
+def _cleanup_memory():
+    """Centralized memory cleanup utility"""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 # Global profiler instance
 PROFILER = ProfilerStats()
 
 def get_memory_usage_mb() -> float:
     """Get current memory usage in MB"""
     try:
-        process = psutil.Process(os.getpid())
-        return process.memory_info().rss / 1024 / 1024  # Convert to MB
+        return psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
     except Exception:
         return 0.0
 
@@ -166,10 +171,7 @@ def profile_context(name: str, enabled: bool = True):
         if elapsed_time > 1.0:  # Log slow operations
             logger.info(f"🕒 {name}: {elapsed_time:.2f}s, {memory_used:+.1f}MB")
         
-        # Clean up after profiling
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        _cleanup_memory()
 
 @contextmanager
 def memory_managed_pdf_processing(pdf_path: str):
@@ -185,10 +187,7 @@ def memory_managed_pdf_processing(pdf_path: str):
     finally:
         if doc is not None:
             doc.close()
-            del doc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        _cleanup_memory()
 
 def print_profiling_report():
     """Print a detailed profiling report"""
@@ -291,28 +290,18 @@ class EnhancedPDFProcessor:
                                     'num_cols': len(df.columns)
                                 })
                             
-                            # Clear DataFrame to free memory
-                            del df
-                        
-                        # Clear table data to free memory
-                        del table_data
                         
                 except Exception as e:
                     logger.warning(f"Error extracting tables from page {page_num + 1}: {e}")
                 
-                # Clear page reference
-                del page
         
         except Exception as e:
             logger.warning(f"Error opening PDF {pdf_path}: {e}")
         
         finally:
-            # Ensure document is always closed
             if doc is not None:
                 doc.close()
-                del doc
-            # Force garbage collection
-            gc.collect()
+            _cleanup_memory()
         
         return tables_data
     
@@ -432,22 +421,15 @@ class EnhancedPDFProcessor:
                     chunks = self._chunk_page(doc_obj)
                     all_chunks.extend(chunks)
                     
-                    # Clear intermediate objects
-                    del doc_obj, chunks
                 
-                # Clear page reference and text
-                del page, text
         
         except Exception as e:
             logger.error(f"Error processing {pdf_path} with PyMuPDF: {e}")
         
         finally:
-            # Ensure document is always closed
             if doc is not None:
                 doc.close()
-                del doc
-            # Force garbage collection
-            gc.collect()
+            _cleanup_memory()
         
         return all_chunks
     
@@ -563,36 +545,29 @@ class LiteratureRAG:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         logger.info(f"Using device: {device}")
         
-        # Configure model to use all available CPU cores for native multithreading
-        import os
+        # Configure PyTorch for optimal CPU multithreading
         num_threads = os.cpu_count()
-        
-        # Set PyTorch thread count for native multithreading
         torch.set_num_threads(num_threads)
         torch.set_num_interop_threads(num_threads)
-        
         logger.info(f"Configured PyTorch to use {num_threads} threads for native multithreading")
         
-        # Use SentenceTransformer with ONNX backend for native CPU multithreading
+        # Initialize embedding model with ONNX backend for better performance
         try:
-            # Try ModernBERT first for better performance
             self.embedding_model = SentenceTransformer(
                 "answerdotai/ModernBERT-base",
                 device=device,
-                backend="onnx"  # Use ONNX for better CPU multithreading
+                backend="onnx"
             )
             logger.info("Using ModernBERT-base with ONNX backend")
         except Exception as e:
             logger.error(f"ModernBERT not available: {e}")
             raise
-        # Use Ollama client directly
         self.llm_client = ollama.Client()
         self.llm_model = "qwen3:latest"
         
         os.makedirs(self.db_directory, exist_ok=True)
         os.makedirs(self.pdf_directory, exist_ok=True)
         
-        # Initialize ChromaDB client
         self.chroma_client = chromadb.PersistentClient(
             path=self.db_directory,
             settings=Settings(anonymized_telemetry=False)
@@ -632,20 +607,11 @@ class LiteratureRAG:
                 )
                 all_embeddings.extend(embeddings.tolist())
                 
-                # Clear embedding tensors from memory
-                del embeddings
-                
-                # Force garbage collection and clear GPU cache after each chunk
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                _cleanup_memory()
                 
             except Exception as e:
                 logger.error(f"Error processing embedding chunk {i//max_chunk_size + 1}: {e}")
-                # Clean up on error
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                _cleanup_memory()
         
         if total_texts > 100:
             logger.info(f"✅ Embedding generation complete for {total_texts} chunks")
@@ -804,12 +770,10 @@ class LiteratureRAG:
     def _clear_collections(self) -> None:
         """Clear existing collections for force reindexing and clean up orphaned directories"""
         try:
-            # Get list of directories before deletion to identify orphaned ones
             existing_dirs_before = set()
             if os.path.exists(self.db_directory):
                 for item in os.listdir(self.db_directory):
                     item_path = os.path.join(self.db_directory, item)
-                    # Check if it's a UUID-format directory (36 chars with hyphens)
                     if os.path.isdir(item_path) and len(item) == 36 and item.count('-') == 4:
                         existing_dirs_before.add(item)
             
@@ -830,25 +794,21 @@ class LiteratureRAG:
             # Clean up orphaned ChromaDB directories
             # ChromaDB sometimes doesn't remove the physical directories when collections are deleted
             if existing_dirs_before and os.path.exists(self.db_directory):
-                # Get current directories after deletion
                 existing_dirs_after = set()
                 for item in os.listdir(self.db_directory):
                     item_path = os.path.join(self.db_directory, item)
                     if os.path.isdir(item_path) and len(item) == 36 and item.count('-') == 4:
                         existing_dirs_after.add(item)
                 
-                # Find orphaned directories (existed before, still exist after deletion)
                 orphaned_dirs = existing_dirs_before.intersection(existing_dirs_after)
                 
                 for orphaned_dir in orphaned_dirs:
                     orphaned_path = os.path.join(self.db_directory, orphaned_dir)
                     try:
-                        # Double-check that no collections reference this directory
                         active_collections = [col.name for col in self.chroma_client.list_collections()]
-                        # If we just deleted our collections and no others exist, it's safe to remove
-                        if not active_collections or (active_collections and 
-                            self.text_collection_name not in active_collections and 
-                            self.table_collection_name not in active_collections):
+                        if (not active_collections or 
+                            (self.text_collection_name not in active_collections and 
+                             self.table_collection_name not in active_collections)):
                             logger.info(f"🧹 Removing orphaned ChromaDB directory: {orphaned_dir}")
                             shutil.rmtree(orphaned_path)
                     except Exception as e:
@@ -910,22 +870,13 @@ class LiteratureRAG:
                     total_text_chunks += len(text_chunks)
                     total_tables += len(table_docs)
                 
-                # Clear memory after each PDF
-                del text_chunks, table_docs
-                
-                # Force garbage collection and clear GPU cache
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                _cleanup_memory()
                 
                 logger.info(f"Completed PDF {pdf_idx}/{len(pdf_files)}: {pdf_file.name}")
                 
             except Exception as e:
                 logger.error(f"Error processing {pdf_file.name}: {e}")
-                # Clean up on error too
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                _cleanup_memory()
         
         logger.info(f"Batch processing complete! Total: {total_text_chunks} text chunks, {total_tables} tables")
     
@@ -969,73 +920,35 @@ class LiteratureRAG:
                 if len(table_docs) > batch_size:
                     logger.info(f"Processed table batch {i//batch_size + 1}/{(len(table_docs) + batch_size - 1)//batch_size}")
     
-    @profile_function("LiteratureRAG._add_text_batch_to_vectorstore")
-    def _add_text_batch_to_vectorstore(self, text_batch: List[Document]) -> None:
-        """Add a batch of text documents to the vector store with memory cleanup"""
-        if not text_batch:
+    @profile_function("LiteratureRAG._add_batch_to_vectorstore")
+    def _add_batch_to_vectorstore(self, documents: List[Document], collection, doc_type: str) -> None:
+        """Add a batch of documents to the specified vector store with memory cleanup"""
+        if not documents:
             return
         
-        texts = [doc.page_content for doc in text_batch]
-        metadatas = [doc.metadata for doc in text_batch]
-        ids = [f"text_{i}_{hashlib.md5(text.encode()).hexdigest()[:8]}" 
+        texts = [doc.page_content for doc in documents]
+        metadatas = [doc.metadata for doc in documents]
+        ids = [f"{doc_type}_{i}_{hashlib.md5(text.encode()).hexdigest()[:8]}" 
                for i, text in enumerate(texts)]
         
         try:
-            # Generate embeddings for this batch
             embeddings = self._embed_texts(texts)
-            
-            # Add to collection
-            self.text_collection.add(
+            collection.add(
                 documents=texts,
                 embeddings=embeddings,
                 metadatas=metadatas,
                 ids=ids
             )
-            
         finally:
-            # Clean up intermediate variables
-            if 'embeddings' in locals():
-                del embeddings
-            del texts, metadatas, ids
-            
-            # Force garbage collection
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            _cleanup_memory()
     
-    @profile_function("LiteratureRAG._add_table_batch_to_vectorstore")
+    def _add_text_batch_to_vectorstore(self, text_batch: List[Document]) -> None:
+        """Add a batch of text documents to the vector store"""
+        self._add_batch_to_vectorstore(text_batch, self.text_collection, "text")
+    
     def _add_table_batch_to_vectorstore(self, table_batch: List[Document]) -> None:
-        """Add a batch of table documents to the vector store with memory cleanup"""
-        if not table_batch:
-            return
-        
-        texts = [doc.page_content for doc in table_batch]
-        metadatas = [doc.metadata for doc in table_batch]
-        ids = [f"table_{i}_{hashlib.md5(text.encode()).hexdigest()[:8]}" 
-               for i, text in enumerate(texts)]
-        
-        try:
-            # Generate embeddings for this batch
-            embeddings = self._embed_texts(texts)
-            
-            # Add to collection
-            self.table_collection.add(
-                documents=texts,
-                embeddings=embeddings,
-                metadatas=metadatas,
-                ids=ids
-            )
-            
-        finally:
-            # Clean up intermediate variables
-            if 'embeddings' in locals():
-                del embeddings
-            del texts, metadatas, ids
-            
-            # Force garbage collection
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        """Add a batch of table documents to the vector store"""
+        self._add_batch_to_vectorstore(table_batch, self.table_collection, "table")
     
     @profile_function("LiteratureRAG._similarity_search")
     def _similarity_search(self, collection, query: str, k: int = 5) -> List[Document]:
@@ -1066,16 +979,7 @@ class LiteratureRAG:
             return documents
         
         finally:
-            # Clean up variables
-            if 'query_embedding' in locals():
-                del query_embedding
-            if 'results' in locals():
-                del results
-            
-            # Force garbage collection
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            _cleanup_memory()
     
     def _filter_thinking_sections(self, text: str) -> str:
         """Remove <think></think> sections from model responses"""
@@ -1270,47 +1174,67 @@ Answer: """
         # Execute plan
         tool_results = self._execute_plan(plan)
         
-        # Get documents from retriever and use basic RAG approach
-        retrieval_result = None
+        # Process results from agentic tools
+        answer = "Unable to process query with available tools."
+        sources = []
+        tools_used = [result.tool_name for result in tool_results if result.success]
+        
+        # Look for synthesis result first (highest priority)
+        synthesis_result = None
         for result in tool_results:
-            if result.tool_name == 'retriever':
-                retrieval_result = result
+            if result.tool_name == 'synthesizer' and result.success:
+                synthesis_result = result
                 break
         
-        if retrieval_result and retrieval_result.success:
-            # Use retrieved documents with basic RAG approach
-            documents = retrieval_result.result
-            if documents:
-                # Format context from retrieved documents
-                context_parts = []
-                sources = []
-                for doc in documents[:7]:  # Use top 7 docs
-                    if isinstance(doc, dict):
-                        metadata = doc.get('metadata', {})
-                        paper_name = metadata.get('paper_name', 'Unknown')
-                        page = metadata.get('page', 'N/A')
-                        content = doc.get('content', '')
-                        context_parts.append(f"[{paper_name}, p.{page}]: {content}")
-                        sources.append({
-                            'paper': paper_name,
-                            'page': page,
-                            'type': metadata.get('source_type', 'text')
-                        })
-                
-                combined_context = "\n\n".join(context_parts)
-                answer = self._generate_response(question, combined_context)
-                tools_used = ['retriever']
-            else:
-                answer = "No relevant documents found."
-                sources = []
-                tools_used = ['retriever']
+        if synthesis_result:
+            # Use synthesis result as the primary answer
+            answer = synthesis_result.result.get('response', 'No synthesis available')
+            sources = synthesis_result.result.get('sources', [])
         else:
-            # Fallback to basic RAG if retrieval fails
-            logger.warning("Retrieval failed, falling back to basic RAG")
-            basic_result = self.query(question)
-            answer = basic_result['answer']
-            sources = basic_result['sources']
-            tools_used = ['basic_rag']
+            # Look for other successful tool results in priority order
+            priority_tools = ['comparator', 'refined_searcher', 'summarizer', 'document_retriever']
+            
+            for tool_name in priority_tools:
+                for result in tool_results:
+                    if result.tool_name == tool_name and result.success:
+                        if tool_name == 'document_retriever':
+                            # Handle retriever result
+                            documents = result.result
+                            if documents:
+                                context_parts = []
+                                sources = []
+                                for doc in documents[:7]:
+                                    if isinstance(doc, dict):
+                                        metadata = doc.get('metadata', {})
+                                        paper_name = metadata.get('paper_name', 'Unknown')
+                                        page = metadata.get('page', 'N/A')
+                                        content = doc.get('content', '')
+                                        context_parts.append(f"[{paper_name}, p.{page}]: {content}")
+                                        sources.append({
+                                            'paper': paper_name,
+                                            'page': page,
+                                            'type': metadata.get('source_type', 'text')
+                                        })
+                                
+                                combined_context = "\n\n".join(context_parts)
+                                answer = self._generate_response(question, combined_context)
+                            else:
+                                answer = "No relevant documents found in the knowledge base."
+                        else:
+                            # Handle other tool results
+                            tool_result = result.result
+                            if isinstance(tool_result, dict):
+                                answer = tool_result.get('response', 'Tool completed but no response available')
+                                sources = tool_result.get('sources', [])
+                            else:
+                                answer = str(tool_result)
+                        break
+                if answer != "Unable to process query with available tools.":
+                    break
+        
+        # If no tools succeeded, provide informative error
+        if not tools_used:
+            answer = "All agentic tools failed to process the query. Please check the system logs for details."
         
         response = {
             'answer': answer,
@@ -1382,22 +1306,15 @@ Answer: """
     def _create_execution_plan(self, query: str, analysis: Dict[str, Any]) -> QueryPlan:
         """Create adaptive execution plan based on intent and complexity"""
         
-        # Since we're using a simple approach, no query decomposition needed
         sub_queries = [query]
-        tools_sequence = []
-        
-        # Determine retrieval strategy based on intent
-        # Simple, effective 1-tool approach - just retrieve documents
-        tools_sequence = [
-            {
-                'tool': 'retriever',
-                'context': {
-                    'retrieval_count': 7,
-                    'include_tables': True
-                },
-                'confidence_threshold': 0.7
-            }
-        ]
+        tools_sequence = [{
+            'tool': 'retriever',
+            'context': {
+                'retrieval_count': 7,
+                'include_tables': True
+            },
+            'confidence_threshold': 0.7
+        }]
         
         reasoning = self._generate_plan_reasoning(analysis, tools_sequence)
         
@@ -1425,128 +1342,23 @@ Answer: """
         return reasoning
     
     def _execute_plan(self, plan: QueryPlan) -> List[ToolResult]:
-        """Execute plan with adaptive refinement and confidence tracking"""
-        results = {}
-        execution_order = []
-        confidence_scores = {}
+        """Execute plan with simple tool execution"""
+        results = []
         
-        # Track execution metadata
-        execution_metadata = {
-            'retries': 0,
-            'fallbacks': 0,
-            'refinements': 0
-        }
-        
-        remaining_tools = plan.tools_sequence.copy()
-        
-        while remaining_tools:
-            ready_tools = []
-            for tool_config in remaining_tools:
-                dependencies = tool_config.get('depends_on', [])
-                if not dependencies or all(dep in execution_order for dep in dependencies):
-                    ready_tools.append(tool_config)
+        for tool_config in plan.tools_sequence:
+            tool_name = tool_config['tool']
+            tool_context = tool_config['context']
             
-            if not ready_tools:
-                # Check if we should switch to alternative plan
-                ready_tools = [remaining_tools[0]]
-                logger.warning("Dependency cycle detected, forcing execution")
+            tool = self._agentic_tools[tool_name]
+            logger.info(f"Executing tool: {tool_name}")
             
-            for tool_config in ready_tools:
-                tool_name = tool_config['tool']
-                tool_context = tool_config['context'].copy()
-                confidence_threshold = tool_config.get('confidence_threshold', 0.7)
-                
-                # Aggregate context from dependencies
-                dependencies = tool_config.get('depends_on', [])
-                for dep in dependencies:
-                    if dep in results:
-                        if dep == 'retriever':
-                            tool_context['documents'] = results[dep].result
-                            tool_context['initial_results'] = results[dep].result
-                        else:
-                            tool_context[f'{dep}_result'] = results[dep].result
-                
-                # Execute tool with retry logic
-                tool = self._agentic_tools[tool_name]
-                logger.info(f"Executing tool: {tool_name}")
-                
-                result = tool.execute(plan.original_query, tool_context, self)
-                
-                # Validate result and calculate confidence
-                confidence = self._validate_tool_result(result, tool_config)
-                confidence_scores[tool_name] = confidence
-                
-                # Handle low confidence results
-                if confidence < confidence_threshold and execution_metadata['retries'] < 2:
-                    logger.info(f"Low confidence ({confidence:.2f}) for {tool_name}, attempting refinement")
-                    
-                    # Try to refine the result
-                    refined_context = tool_context.copy()
-                    refined_context['refinement_needed'] = True
-                    refined_context['previous_confidence'] = confidence
-                    
-                    result = tool.execute(plan.original_query, refined_context, self)
-                    new_confidence = self._validate_tool_result(result, tool_config)
-                    
-                    if new_confidence > confidence:
-                        confidence = new_confidence
-                        confidence_scores[tool_name] = confidence
-                        execution_metadata['refinements'] += 1
-                        logger.info(f"Refinement improved confidence to {confidence:.2f}")
-                
-                results[tool_name] = result
-                execution_order.append(tool_name)
-                
-                # Add confidence to result metadata
-                if not hasattr(result, 'metadata'):
-                    result.metadata = {}
-                result.metadata['confidence'] = confidence
-                
-                logger.info(f"Tool {tool_name} completed in {result.execution_time:.2f}s - Success: {result.success} - Confidence: {confidence:.2f}")
+            result = tool.execute(plan.original_query, tool_context, self)
+            results.append(result)
             
-            remaining_tools = [t for t in remaining_tools if t['tool'] not in execution_order]
+            logger.info(f"Tool {tool_name} completed in {result.execution_time:.2f}s - Success: {result.success}")
         
-        # Add execution metadata to results
-        for result in results.values():
-            if hasattr(result, 'metadata'):
-                result.metadata['execution_stats'] = execution_metadata
-        
-        return list(results.values())
+        return results
     
-    def _validate_tool_result(self, result: ToolResult, tool_config: Dict) -> float:
-        """Validate tool result and calculate confidence score"""
-        if not result or not result.success:
-            return 0.0
-        
-        confidence = 0.5  # Base confidence
-        
-        # Check if result has content
-        if hasattr(result, 'result'):
-            if result.result:
-                confidence += 0.2
-                
-                # Check result size/quality
-                if isinstance(result.result, (list, dict)):
-                    if len(str(result.result)) > 100:
-                        confidence += 0.1
-                    if isinstance(result.result, dict) and 'answer' in result.result:
-                        confidence += 0.1
-                elif isinstance(result.result, str) and len(result.result) > 50:
-                    confidence += 0.2
-        
-        # Check execution time (faster is generally better for simple tools)
-        if hasattr(result, 'execution_time'):
-            if result.execution_time < 2.0:
-                confidence += 0.1
-        
-        # Tool-specific validation
-        tool_name = tool_config.get('tool', '')
-        if tool_name == 'document_retriever' and hasattr(result, 'metadata'):
-            doc_count = result.metadata.get('documents_retrieved', 0)
-            if doc_count > 0:
-                confidence = min(confidence + (doc_count * 0.05), 0.95)
-        
-        return min(confidence, 1.0)
 
 
 class DocumentRetrieverTool(AgentTool):
